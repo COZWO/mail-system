@@ -82,9 +82,14 @@ flowchart TB
     end
 
     subgraph Service & Control Layer
-        ACCOUNT[mail-account-service\nUser Auth / Domain / Quota]
+        ACCOUNT[mail-account-service\nUser Auth Adapter]
         ADMIN[mail-admin-api\nWebAdmin REST API]
         SEARCH_WORKER[mail-search-worker\nIndexer Worker]
+    end
+
+    subgraph IAM & IdP Platform
+        AUTH_SYSTEM[Auth-System Core\n/projects/Auth-System\nOIDC / Flow Engine / Argon2id]
+        AUTH_LDAP[Auth-System Outpost\nVirtual LDAP Server]
     end
 
     subgraph Persistence & Infrastructure Layer
@@ -102,7 +107,10 @@ flowchart TB
 
     SMTP_IN -->|Authenticates| ACCOUNT
     IMAP_POP3 -->|Authenticates| ACCOUNT
-    JMAP_API -->|Authenticates| ACCOUNT
+    JMAP_API -->|Verify Bearer JWT| AUTH_SYSTEM
+
+    ACCOUNT -->|Validate Credential & Flow| AUTH_SYSTEM
+    ACCOUNT -->|Fetch User Directory| AUTH_LDAP
 
     SMTP_IN -->|Produce Spool Message| NATS
     NATS -->|Consume Spool| MAILET
@@ -292,6 +300,73 @@ func (e *Engine) Process(ctx context.Context, env *MailEnvelope) error {
 		}
 	}
 	return nil
+}
+```
+
+### 5.3 Auth-System (`/projects/Auth-System`) 연동 명세
+Mail-System은 인증 및 사용자 계정 관리 로직을 자체 구현하는 대신, 사내 고성능 IAM/IdP 인프라치인 **Auth-System**과 연동하여 보안성과 관리 효율성을 높입니다.
+
+#### 연동 구성요소 및 방식
+1. **SSO 및 프로토콜 인증 연동**:
+   * **SMTP (587/465) / IMAP (993) / POP3 (995)**: 전통적인 이메일 클라이언트 인증 시 `mail-account-service` 어댑터를 통해 `Auth-System`의 Argon2id 비밀번호 검증 API 또는 `Auth-System Edge Outpost` (Virtual LDAP Server)를 호출하여 인증을 수행합니다.
+   * **JMAP API & WebMail (443)**: `Auth-System` OIDC Provider (`/realms/:realm/protocol/openid-connect/auth`)의 **PKCE Authorization Code Flow**를 거쳐 로그인 및 MFA(TOTP/WebAuthn) 검증 후 발급된 **Bearer Access Token (JWT)**을 `Auth-System JWKS Certs`로 검증합니다.
+2. **Realm 기반 멀티테넌시 도메인 매핑**:
+   * `Auth-System`의 **Realm** 개념을 이메일 도메인(e.g. `realm: company-a.com` -> `user@company-a.com`)과 1:1 매핑하여 멀티 테넌트 메일 환경을 격리합니다.
+3. **소셜 계정 메일 브로커 연동**:
+   * `Auth-System`에 내장된 카카오/네이버 동적 소셜 OAuth SPI를 통해 소셜 계정으로 로그인한 사용자의 이메일 주소를 메일 시스템과 자동 프로비저닝(Federated Identity)합니다.
+
+```go
+// internal/auth/auth_system_client.go
+package auth
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"bytes"
+)
+
+type AuthSystemClient struct {
+	BaseURL string
+}
+
+type LoginFlowRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type AuthResult struct {
+	Status    string `json:"status"`
+	SessionID string `json:"session_id"`
+}
+
+// Auth-System Flow Executor API를 호출하여 이메일 사용자 인증 수행
+func (c *AuthSystemClient) AuthenticateUser(ctx context.Context, realm string, username, password string) (*AuthResult, error) {
+	reqBody, _ := json.Marshal(LoginFlowRequest{Username: username, Password: password})
+	url := fmt.Sprintf("%s/flows/executor/default-login/?realm=%s", c.BaseURL, realm)
+	
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBuffer(reqBody))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("authentication failed with status: %d", resp.StatusCode)
+	}
+
+	var result AuthResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	return &result, nil
 }
 ```
 
