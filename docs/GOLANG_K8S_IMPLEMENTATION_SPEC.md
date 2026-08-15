@@ -32,12 +32,24 @@ james-project-master/
 └── event-bus/       # 분산 이벤트 버스 (RabbitMQ/Kafka 기반 메일함 상태 동기화)
 ```
 
-### 주요 한계점 및 Golang 마이크로서비스 전환 필요성
-1. **높은 결합도**: 프로토콜 서버와 메일 저장소, 스풀링 큐가 단일 런타임에서 실행되어 특정 서비스(예: SMTP 폭주)의 장애가 IMAP 읽기 서비스로 전파됨.
-2. **복잡한 DI 및 설정**: Guice/Spring 백엔드 종속으로 인해 인프라 확장 및 커스텀 로직 추가 시 학습 곡선과 빌드 시간이 길어짐.
-3. **리소스 소비**: JVM 파이프라인 및 Netty 버퍼 관리 오버헤드로 대규모 커넥션 수용 시 메모리 점유율이 높음.
+### 2.2 기존 Apache James의 데이터베이스 및 저장소(Database & Storage) 분석
+
+`.Alternative_Project/james-project-master` 소스 코드 및 배포 앱 프로파일 분석 결과, Apache James는 용도 및 배포 환경(Distributed/Postgres/JPA/Memory)에 따라 다음과 같이 다양한 데이터베이스 및 저장소 백엔드를 조합하여 사용합니다.
+
+| 저장소 분류 | 사용 데이터베이스 / 기술 | 사용 목적 및 저장 데이터 | Golang 전환 시 대응 기술 |
+| :--- | :--- | :--- | :--- |
+| **RDBMS (관계형 DB)** | **PostgreSQL** / JPA (MySQL, H2, Derby) | 계정(User), 도메인(Domain), 메일함 메타데이터, Quota, 수신자 리라이트 규칙 | **PostgreSQL** (`GORM` / `pgx`) |
+| **NoSQL (분산 DB)** | **Apache Cassandra** | 대규모 분산 환경에서의 메일함 메타데이터, 유저 권한, 검색 색인 보조 | **PostgreSQL** 또는 **Cassandra** (`gocql`) |
+| **Object Storage** | **AWS S3** / **MinIO** / Scality Cloudserver | 메일 본문 및 첨부파일 (MIME EML Blob) 저장소 (`blob-s3`) | **AWS S3 / MinIO** (`aws-sdk-go-v2`) |
+| **Search Engine** | **OpenSearch** / **Elasticsearch** / Lucene | 메일 제목, 수발신자, 본문 텍스트 전문 검색(Full-Text Search) 색인 | **OpenSearch / Elasticsearch** |
+| **In-Memory Cache** | **Redis** | 유저 인증 세션, Rate Limiting, 분산 락, 임시 쿼타 캐시 | **Redis Cluster** (`go-redis/v9`) |
+| **Messaging Queue** | **RabbitMQ** / **Apache Pulsar** | 메일 수신 스풀 큐(Spooling Queue), 메일함 변경 이벤트 버스 (Event Bus) | **NATS JetStream** 또는 **RabbitMQ** |
+
+* **단일/소규모 배포판 (`postgres-app`)**: PostgreSQL + OpenSearch + MinIO(S3) + RabbitMQ
+* **대규모 분산 배포판 (`distributed-app`)**: Cassandra + OpenSearch + MinIO(S3) + RabbitMQ / Pulsar
 
 ---
+
 
 ## 3. Golang 마이크로서비스 아키텍처 설계
 
